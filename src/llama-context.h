@@ -238,6 +238,11 @@ public:
     // DFlash: Set accumulated target_ctx from encoder output for decoder input
     void set_dflash_accumulated_target_ctx(const float * data, int32_t n_embd, int32_t n_tokens);
 
+    // DSpark: compute the per-step Markov logit bias on-device:
+    //   out_bias[i*n_vocab + v] = sum_r markov_w2[v, r] * markov_w1[prev[i], r]
+    // for n requests, via the context scheduler. out_bias must hold n*n_vocab floats.
+    void dspark_markov_bias(const llama_token * prev, int32_t n, float * out_bias);
+
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
 private:

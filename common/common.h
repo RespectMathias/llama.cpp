@@ -160,6 +160,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_DRAFT,         // draft model
     COMMON_SPECULATIVE_TYPE_EAGLE3,        // eagle draft model
     COMMON_SPECULATIVE_TYPE_DFLASH,        // dflash draft model
+    COMMON_SPECULATIVE_TYPE_DSPARK,        // dspark draft model (semi-autoregressive + Markov)
     COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,  // simple self-speculative decoding
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,   // self-speculative decoding with n-gram keys only
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
@@ -330,6 +331,8 @@ struct common_params_speculative {
 
     bool    eagle3       = false; // use EAGLE3 speculative decoding
     bool    dflash       = false; // use DFlash speculative decoding
+    bool    dspark       = false; // use DSpark speculative decoding (semi-autoregressive + Markov)
+    float   dspark_confidence_threshold = 0.0f; // DSpark: prune draft prefix below this confidence (0 = off)
 
     int32_t n_ctx        = 0;  // draft context size
     int32_t n_gpu_layers = -1; // number of layers to store in VRAM for the draft model (-1 - use default)

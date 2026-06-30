@@ -564,6 +564,13 @@ struct llama_model {
     struct ggml_tensor * dflash_hidden_norm = nullptr;
     struct ggml_tensor * target_output = nullptr;  // reference to target model's lm_head
 
+    // dspark (reuses shared fc / tok_embd / output / output_norm; own embeddings, not tied)
+    struct ggml_tensor * dspark_hidden_norm = nullptr;
+    struct ggml_tensor * dspark_markov_w1   = nullptr;  // [n_embd_markov_rank, n_vocab] prev-token embed
+    struct ggml_tensor * dspark_markov_w2   = nullptr;  // [n_embd_markov_rank, n_vocab] bias projection
+    struct ggml_tensor * dspark_conf_proj   = nullptr;  // [n_embd + markov_rank, 1] confidence head
+    struct ggml_tensor * dspark_conf_proj_b = nullptr;  // [1] confidence head bias
+
     std::vector<llama_layer> layers;
 
     //Dense linear projections for SentenceTransformers models like embeddinggemma

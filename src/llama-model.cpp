@@ -2809,6 +2809,32 @@ void llama_model::load_hparams(llama_model_loader & ml) {
 
                 type = LLM_TYPE_UNKNOWN;
             } break;
+        case LLM_ARCH_DSPARK:
+            {
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+
+                ml.get_key(LLM_KV_DSPARK_BLOCK_SIZE,    hparams.dspark_block_size,    false);
+                ml.get_key(LLM_KV_DSPARK_MASK_TOKEN_ID, hparams.dspark_mask_token_id, false);
+                ml.get_key(LLM_KV_DSPARK_MARKOV_RANK,   hparams.dspark_markov_rank,   false);
+                ml.get_key(LLM_KV_DSPARK_CONFIDENCE_HEAD,             hparams.dspark_confidence_head,             false);
+                ml.get_key(LLM_KV_DSPARK_CONFIDENCE_HEAD_WITH_MARKOV, hparams.dspark_confidence_head_with_markov, false);
+
+                if (!ml.get_key_or_arr(LLM_KV_DSPARK_TARGET_LAYER_IDS, hparams.dspark_target_layer_ids, 5, false)) {
+                    throw std::runtime_error("DSpark model requires 'target_layer_ids' in GGUF metadata");
+                }
+                LLAMA_LOG_INFO("%s: DSpark extract_layers = [%d, %d, %d, %d, %d]\n", __func__,
+                               hparams.dspark_target_layer_ids[0],
+                               hparams.dspark_target_layer_ids[1],
+                               hparams.dspark_target_layer_ids[2],
+                               hparams.dspark_target_layer_ids[3],
+                               hparams.dspark_target_layer_ids[4]);
+
+                LLAMA_LOG_INFO("%s: DSpark block_size = %u, mask_token_id = %u, markov_rank = %u, confidence_head = %d\n",
+                               __func__, hparams.dspark_block_size, hparams.dspark_mask_token_id,
+                               hparams.dspark_markov_rank, (int) hparams.dspark_confidence_head);
+
+                type = LLM_TYPE_UNKNOWN;
+            } break;
         case LLM_ARCH_COGVLM:
             {
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
@@ -7396,6 +7422,53 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd, n_ff}, 0);
                     }
                 } break;
+            case LLM_ARCH_DSPARK:
+                {
+                    const int64_t n_target_layer_ids     = (int64_t) hparams.dspark_target_layer_ids.size();
+                    const int64_t n_embd_target_features = n_target_layer_ids * n_embd;
+                    const int64_t markov_rank            = (int64_t) hparams.dspark_markov_rank;
+
+                    // own (non-tied) embeddings + lm_head
+                    tok_embd    = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD,  "weight"), {n_embd, n_vocab}, 0);
+                    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, 0);
+                    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+
+                    // context fusion (same role as DFlash fc) + post-fusion norm
+                    fc                 = create_tensor(tn(LLM_TENSOR_DSPARK_FC,          "weight"), {n_embd_target_features, n_embd}, 0);
+                    dspark_hidden_norm = create_tensor(tn(LLM_TENSOR_DSPARK_HIDDEN_NORM, "weight"), {n_embd}, 0);
+
+                    // Markov head: torch [n_vocab, markov_rank] -> ggml {markov_rank, n_vocab}
+                    // confidence head: torch proj [1, n_embd+markov_rank] -> ggml {n_embd+markov_rank, 1}
+                    dspark_markov_w1 = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W1, "weight"), {markov_rank, n_vocab}, 0);
+                    dspark_markov_w2 = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W2, "weight"), {markov_rank, n_vocab}, 0);
+                    dspark_conf_proj = create_tensor(tn(LLM_TENSOR_DSPARK_CONF_PROJ, "weight"), {n_embd + markov_rank, 1}, TENSOR_NOT_REQUIRED);
+                    dspark_conf_proj_b = create_tensor(tn(LLM_TENSOR_DSPARK_CONF_PROJ, "bias"), {1}, TENSOR_NOT_REQUIRED);
+
+                    for (int i = 0; i < n_layer; ++i) {
+                        auto & layer = layers[i];
+
+                        layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
+
+                        layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q, "weight", i), {n_embd, n_embd_head_k * n_head}, 0);
+                        layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K, "weight", i), {n_embd, n_embd_k_gqa}, 0);
+                        layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V, "weight", i), {n_embd, n_embd_v_gqa}, 0);
+                        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head_k * n_head, n_embd}, 0);
+
+                        // attention bias absent in DSpark (attention_bias = false), keep optional for safety
+                        layer.wq_b = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "bias", i), {n_embd_head_k * n_head}, TENSOR_NOT_REQUIRED);
+                        layer.wk_b = create_tensor(tn(LLM_TENSOR_ATTN_K,   "bias", i), {n_embd_k_gqa},          TENSOR_NOT_REQUIRED);
+                        layer.wv_b = create_tensor(tn(LLM_TENSOR_ATTN_V,   "bias", i), {n_embd_v_gqa},          TENSOR_NOT_REQUIRED);
+                        layer.wo_b = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "bias", i), {n_embd},                TENSOR_NOT_REQUIRED);
+
+                        layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), {n_embd_head_k}, 0);
+                        layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), {n_embd_head_k}, 0);
+
+                        layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
+                        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd, n_ff}, 0);
+                        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff, n_embd}, 0);
+                        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd, n_ff}, 0);
+                    }
+                } break;
             case LLM_ARCH_KIMI_LINEAR:
                 {
                     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
@@ -8583,7 +8656,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         case LLM_ARCH_LLADA:
         case LLM_ARCH_LLADA_MOE:
         case LLM_ARCH_RND1:
-        case LLM_ARCH_DFLASH: // current DFlash decoder doesn't support KV-cache due to cross_attn + self_attn (no mask) 
+        case LLM_ARCH_DFLASH: // current DFlash decoder doesn't support KV-cache due to cross_attn + self_attn (no mask)
+        case LLM_ARCH_DSPARK: // DSpark decoder reuses the DFlash cross_attn + self_attn (no mask) scheme
             {
                 res = nullptr;
             } break;
@@ -9190,6 +9264,14 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
                     llm = std::make_unique<llm_build_dflash_decode>(*this, params);
                 }
             } break;
+        case LLM_ARCH_DSPARK:
+            {
+                if (params.gtype == LLM_GRAPH_TYPE_ENCODER) {
+                    llm = std::make_unique<llm_build_dspark_encode>(*this, params);
+                } else {
+                    llm = std::make_unique<llm_build_dspark_decode>(*this, params);
+                }
+            } break;
         case LLM_ARCH_COGVLM:
             {
                 llm = std::make_unique<llm_build_cogvlm>(*this, params);
@@ -9328,6 +9410,54 @@ int32_t llama_model_dflash_mask_token_id(const llama_model * model) {
     return (int32_t) model->hparams.dflash_mask_token_id;
 }
 
+int32_t llama_model_dspark_block_size(const llama_model * model) {
+    return (int32_t) model->hparams.dspark_block_size;
+}
+
+int32_t llama_model_dspark_mask_token_id(const llama_model * model) {
+    return (int32_t) model->hparams.dspark_mask_token_id;
+}
+
+int32_t llama_model_dspark_markov_rank(const llama_model * model) {
+    return (int32_t) model->hparams.dspark_markov_rank;
+}
+
+bool llama_model_dspark_confidence_head(const llama_model * model) {
+    return model->hparams.dspark_confidence_head;
+}
+
+// dequantize a model tensor into a caller-provided f32 buffer (host)
+static void dspark_copy_tensor_f32(const ggml_tensor * t, float * dst) {
+    GGML_ASSERT(t != nullptr && dst != nullptr);
+    const int64_t n  = ggml_nelements(t);
+    const size_t  nb = ggml_nbytes(t);
+    std::vector<uint8_t> raw(nb);
+    ggml_backend_tensor_get(t, raw.data(), 0, nb);
+    if (t->type == GGML_TYPE_F32) {
+        std::memcpy(dst, raw.data(), (size_t) n * sizeof(float));
+    } else {
+        const auto * tt = ggml_get_type_traits(t->type);
+        GGML_ASSERT(tt->to_float && "DSpark head tensor type has no to_float conversion");
+        tt->to_float(raw.data(), dst, n);
+    }
+}
+
+void llama_model_dspark_get_markov_w1(const llama_model * model, float * dst) {
+    dspark_copy_tensor_f32(model->dspark_markov_w1, dst);
+}
+
+void llama_model_dspark_get_conf(const llama_model * model, float * dst_w, float * dst_b) {
+    GGML_ASSERT(model->dspark_conf_proj != nullptr && "DSpark model has no confidence head");
+    dspark_copy_tensor_f32(model->dspark_conf_proj, dst_w);
+    if (dst_b) {
+        if (model->dspark_conf_proj_b) {
+            dspark_copy_tensor_f32(model->dspark_conf_proj_b, dst_b);
+        } else {
+            *dst_b = 0.0f;
+        }
+    }
+}
+
 uint32_t llama_model_n_cls_out(const struct llama_model * model) {
     return model->hparams.n_cls_out;
 }
@@ -9443,6 +9573,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_QWEN3:
         case LLM_ARCH_QWEN3MOE:
         case LLM_ARCH_DFLASH:
+        case LLM_ARCH_DSPARK:
         case LLM_ARCH_LLADA_MOE:
         case LLM_ARCH_RND1:
         case LLM_ARCH_OLMO2:

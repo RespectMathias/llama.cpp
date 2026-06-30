@@ -564,6 +564,25 @@ extern "C" {
     // DFlash draft model: mask token id used as filler in the noise block
     LLAMA_API int32_t llama_model_dflash_mask_token_id(const struct llama_model * model);
 
+    // DSpark draft model: anchor-first block size (number of speculative tokens)
+    LLAMA_API int32_t llama_model_dspark_block_size(const struct llama_model * model);
+
+    // DSpark draft model: mask token id used as filler in the noise block
+    LLAMA_API int32_t llama_model_dspark_mask_token_id(const struct llama_model * model);
+
+    // DSpark draft model: low-rank dimension of the Markov head (0 if absent)
+    LLAMA_API int32_t llama_model_dspark_markov_rank(const struct llama_model * model);
+
+    // DSpark draft model: whether a confidence head is present
+    LLAMA_API bool    llama_model_dspark_confidence_head(const struct llama_model * model);
+
+    // DSpark draft model: copy the Markov/confidence head weights into caller buffers as f32
+    // (dequantized once from the model). Used CPU-side by the speculative loop.
+    //   markov_w1 / markov_w2: each [markov_rank * n_vocab] floats, ggml layout (markov_rank contiguous)
+    //   conf weight:           [n_embd + markov_rank] floats; conf bias: 1 float
+    LLAMA_API void llama_model_dspark_get_markov_w1(const struct llama_model * model, float * dst);
+    LLAMA_API void llama_model_dspark_get_conf(const struct llama_model * model, float * dst_w, float * dst_b);
+
     // Get the model's RoPE frequency scaling factor
     LLAMA_API float llama_model_rope_freq_scale_train(const struct llama_model * model);
 
@@ -937,6 +956,13 @@ extern "C" {
                    const float * data,
                        int32_t   n_embd,
                        int32_t   n_tokens);
+
+    // DSpark: compute the per-step Markov logit bias on-device (out_bias holds n*n_vocab floats)
+    LLAMA_API void llama_dspark_markov_bias(
+            struct llama_context * ctx,
+             const llama_token   * prev,
+                       int32_t     n,
+                         float   * out_bias);
 
     //
     // Decoding

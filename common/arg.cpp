@@ -3482,6 +3482,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--dspark"},
+        "use DSpark speculative decoding with the draft model (semi-autoregressive + Markov head)",
+        [](common_params & params) {
+            params.speculative.dspark = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--dspark-confidence-threshold"}, "F",
+        "DSpark: prune the draft prefix at the first position whose confidence falls below F (default: 0.0 = disabled)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.dspark_confidence_threshold = std::stof(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-cd", "--ctx-size-draft"}, "N",
         string_format("size of the prompt context for the draft model (default: %d, 0 = loaded from model)", params.speculative.n_ctx),
         [](common_params & params, int value) {

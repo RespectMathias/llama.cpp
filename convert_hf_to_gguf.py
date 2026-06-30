@@ -1537,6 +1537,9 @@ class TextModel(ModelBase):
         if chkhsh == "d30d75d9059f1aa2c19359de71047b3ae408c70875e8a3ccf8c5fba56c9d8af4":
             # ref: https://huggingface.co/Qwen/Qwen3.5-9B-Instruct
             res = "qwen35"
+        if chkhsh == "1444df51289cfa8063b96f0e62b1125440111bc79a52003ea14b6eac7016fd5f":
+            # ref: https://huggingface.co/Qwen/Qwen3.6-35B-A3B (qwen3_5_moe; same pre-tokenizer regex as qwen35)
+            res = "qwen35"
         if chkhsh == "b4b8ca1f9769494fbd956ebc4c249de6131fb277a4a3345a7a92c7dd7a55808d":
             # ref: https://huggingface.co/jdopensource/JoyAI-LLM-Flash
             res = "joyai-llm"
@@ -4923,6 +4926,81 @@ class DFlashModel(Qwen3Model):
         if name == "hidden_norm.weight":
             yield ("hidden_norm.weight", data_torch)
             return
+        if not name.startswith("model."):
+            name = "model." + name
+        yield from super().modify_tensors(data_torch, name, bid)
+
+
+@ModelBase.register("Qwen3DSparkModel")
+class Qwen3DSparkModel(Qwen3Model):
+    # DSpark = DFlash backbone + Markov head (semi-autoregressive) + confidence head.
+    # Unlike DFlash, DSpark has its OWN embed_tokens / lm_head (tie_word_embeddings = false),
+    # so they are stored in the GGUF as TOKEN_EMBD / OUTPUT.
+    model_arch = gguf.MODEL_ARCH.DSPARK
+
+    def set_vocab(self):
+        # the draft checkpoint ships no tokenizer; reuse the target model's (same Qwen3 vocab)
+        if self.target_model_dir is None:
+            raise ValueError(
+                "DSpark draft model requires --target-model-dir to be specified. "
+                "Please provide the path to the target model directory containing the tokenizer."
+            )
+        logger.info(f"DSPARK: Using tokenizer from target model: {self.target_model_dir}")
+        original_dir = self.dir_model
+        self.dir_model = self.target_model_dir
+        super().set_vocab()
+        self.dir_model = original_dir
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        arch = self.gguf_writer.arch
+
+        # block_size (N) = num_speculative_tokens, anchor-first (NOT 1+N like DFlash)
+        block_size = self.hparams.get("block_size", 7)
+        self.gguf_writer.add_uint32(f"{arch}.block_size", block_size)
+
+        # target hidden-state extraction layers (top-level in DSpark config, unlike DFlash's sub-dict).
+        # mirror DFlash's +1 convention so the runtime extraction hook (shared with DFlash) lines up.
+        # TODO(M2): verify +1 against the qwen3.cpp dspark_extract hook before trusting acceptance.
+        target_layer_ids = self.hparams.get("target_layer_ids", [])
+        if target_layer_ids:
+            extract_layer_ids = [i + 1 for i in target_layer_ids]
+            self.gguf_writer.add_array(f"{arch}.target_layer_ids", extract_layer_ids)
+
+        mask_token_id = self.hparams.get("mask_token_id", None)
+        if mask_token_id is not None:
+            self.gguf_writer.add_uint32(f"{arch}.mask_token_id", mask_token_id)
+
+        # Markov / confidence head metadata
+        markov_rank = self.hparams.get("markov_rank", 0)
+        self.gguf_writer.add_uint32(f"{arch}.markov_rank", markov_rank)
+
+        conf_enabled = bool(self.hparams.get("enable_confidence_head", False))
+        conf_with_markov = bool(self.hparams.get("confidence_head_with_markov", False))
+        self.gguf_writer.add_bool(f"{arch}.confidence_head", conf_enabled)
+        self.gguf_writer.add_bool(f"{arch}.confidence_head_with_markov", conf_with_markov)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # DSpark-specific tensors -> emit the final GGUF name directly (consumed C++-side by
+        # tn(LLM_TENSOR_DSPARK_*, ...)), bypassing the generic tensor-name map.
+        direct = {
+            "fc.weight":                      "fc.weight",
+            "hidden_norm.weight":             "hidden_norm.weight",
+            "markov_head.markov_w1.weight":   "markov_w1.weight",
+            "markov_head.markov_w2.weight":   "markov_w2.weight",
+            "confidence_head.proj.weight":    "conf_proj.weight",
+            "confidence_head.proj.bias":      "conf_proj.bias",
+        }
+        if name in direct:
+            yield (direct[name], data_torch)
+            return
+
+        # own lm_head: keep unprefixed so the standard map routes it to OUTPUT
+        if name == "lm_head.weight":
+            yield from super().modify_tensors(data_torch, name, bid)
+            return
+
+        # backbone layers / embed_tokens / final norm: add the "model." prefix the Qwen3 map expects
         if not name.startswith("model."):
             name = "model." + name
         yield from super().modify_tensors(data_torch, name, bid)

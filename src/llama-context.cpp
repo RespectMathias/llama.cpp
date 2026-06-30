@@ -348,9 +348,9 @@ llama_context::llama_context(
         if (cparams.pipeline_parallel) {
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
-        // temp fix: DFlash encoder/decoder share one model_dft, keep the role on the context
-        dflash_decoder_ctx = model.arch == LLM_ARCH_DFLASH && params.target_model != nullptr;
-        // DFlash decoder: pre-fill cross with reservation size so build_inp_cross_embd
+        // temp fix: DFlash/DSpark encoder/decoder share one model_dft, keep the role on the context
+        dflash_decoder_ctx = (model.arch == LLM_ARCH_DFLASH || model.arch == LLM_ARCH_DSPARK) && params.target_model != nullptr;
+        // DFlash/DSpark decoder: pre-fill cross with reservation size so build_inp_cross_embd
         // uses cparams.n_ctx instead of hparams.n_ctx_train (which can cause OOM)
         if (dflash_decoder_ctx) {
             cross.n_embd = hparams.n_embd;
@@ -1216,14 +1216,22 @@ void llama_context::set_dflash(const llama_model * model) {
 
     const auto & dflash_hparams = model->hparams;
 
-    dflash.extract_layer_indices.assign(
-            dflash_hparams.dflash_target_layer_ids.begin(),
-            dflash_hparams.dflash_target_layer_ids.end()
-            );
+    // DSpark reuses the DFlash extraction machinery; pick its own target_layer_ids array.
+    if (model->arch == LLM_ARCH_DSPARK) {
+        dflash.extract_layer_indices.assign(
+                dflash_hparams.dspark_target_layer_ids.begin(),
+                dflash_hparams.dspark_target_layer_ids.end()
+                );
+    } else {
+        dflash.extract_layer_indices.assign(
+                dflash_hparams.dflash_target_layer_ids.begin(),
+                dflash_hparams.dflash_target_layer_ids.end()
+                );
+    }
 
     dflash.extract_tensors.resize(dflash.extract_layer_indices.size(), nullptr);
 
-    LLAMA_LOG_INFO("%s: DFlash extraction enabled for layers [%d, %d, %d, %d, %d]\n", __func__,
+    LLAMA_LOG_INFO("%s: extraction enabled for layers [%d, %d, %d, %d, %d]\n", __func__,
             dflash.extract_layer_indices[0],
             dflash.extract_layer_indices[1],
             dflash.extract_layer_indices[2],
@@ -1246,9 +1254,58 @@ void llama_context::set_dflash_accumulated_target_ctx(const float * data, int32_
     std::memcpy(cross.v_embd.data(), data, size * sizeof(float));
 }
 
+void llama_context::dspark_markov_bias(const llama_token * prev, int32_t n, float * out_bias) {
+    GGML_ASSERT(prev != nullptr && out_bias != nullptr && n > 0);
+    ggml_tensor * w1 = model.dspark_markov_w1;
+    ggml_tensor * w2 = model.dspark_markov_w2;
+    GGML_ASSERT(w1 && w2 && "DSpark markov weights not loaded");
+
+    const int64_t n_vocab = w2->ne[1]; // w2: [rank, vocab]
+
+    // small aux graph: bias[vocab, n] = mul_mat(w2, get_rows(w1, prev))
+    ggml_init_params gparams = {
+        /*.mem_size   =*/ ggml_tensor_overhead()*8 + ggml_graph_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx0 = ggml_init(gparams);
+
+    ggml_tensor * prev_t = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n);
+    ggml_set_input(prev_t);
+    ggml_set_name(prev_t, "dspark_markov_prev");
+
+    ggml_tensor * w1emb = ggml_get_rows(ctx0, w1, prev_t);          // [rank, n]
+    w1emb = ggml_cast(ctx0, w1emb, GGML_TYPE_F32);                  // mul_mat wants an f32 src1
+    ggml_tensor * bias  = ggml_mul_mat(ctx0, w2, w1emb);            // [vocab, n]
+    ggml_set_output(bias);
+
+    ggml_cgraph * gf = ggml_new_graph(ctx0);
+    ggml_build_forward_expand(gf, bias);
+
+    ggml_backend_sched_reset(sched.get());
+    if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+        LLAMA_LOG_ERROR("%s: failed to allocate DSpark markov graph\n", __func__);
+        ggml_free(ctx0);
+        return;
+    }
+
+    ggml_backend_tensor_set(prev_t, prev, 0, (size_t) n * sizeof(int32_t));
+
+    const ggml_status st = ggml_backend_sched_graph_compute(sched.get(), gf);
+    if (st != GGML_STATUS_SUCCESS) {
+        LLAMA_LOG_ERROR("%s: DSpark markov compute failed (%d)\n", __func__, st);
+        ggml_free(ctx0);
+        return;
+    }
+
+    ggml_backend_tensor_get(bias, out_bias, 0, (size_t) n * n_vocab * sizeof(float));
+
+    ggml_free(ctx0);
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
-    // DFlash decoder runs through encode path due to no kv-cache but it needs decoder graph type
-    if (model.arch == LLM_ARCH_DFLASH && dflash_decoder_ctx && gtype == LLM_GRAPH_TYPE_ENCODER) {
+    // DFlash/DSpark decoder runs through encode path due to no kv-cache but it needs decoder graph type
+    if ((model.arch == LLM_ARCH_DFLASH || model.arch == LLM_ARCH_DSPARK) && dflash_decoder_ctx && gtype == LLM_GRAPH_TYPE_ENCODER) {
         gtype = LLM_GRAPH_TYPE_DECODER;
     }
 
@@ -1316,8 +1373,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             }
         }
 
-        // temp fix DFlash: Fill position tensor for decoder
-        if (model.arch == LLM_ARCH_DFLASH && gtype == LLM_GRAPH_TYPE_DECODER && !cross.v_embd.empty()) {
+        // temp fix DFlash/DSpark: Fill position tensor for decoder
+        if ((model.arch == LLM_ARCH_DFLASH || model.arch == LLM_ARCH_DSPARK) && gtype == LLM_GRAPH_TYPE_DECODER && !cross.v_embd.empty()) {
             const int64_t n_ctx = cross.n_enc;
             const int64_t n_noise = ubatch.n_tokens;
             const int64_t n_total = n_ctx + n_noise;
@@ -1373,6 +1430,8 @@ int llama_context::encode(const llama_batch & batch_inp) {
             n_embd = 3 * hparams.eagle3_target_hidden_size;
         } else if (model.arch == LLM_ARCH_DFLASH) {
             n_embd = (int64_t) hparams.dflash_target_layer_ids.size() * hparams.n_embd;
+        } else if (model.arch == LLM_ARCH_DSPARK) {
+            n_embd = (int64_t) hparams.dspark_target_layer_ids.size() * hparams.n_embd;
         }
     }
     const int64_t n_vocab = model.vocab.n_tokens();
@@ -2295,7 +2354,7 @@ ggml_cgraph * llama_context::graph_reserve(
             gtype = LLM_GRAPH_TYPE_DECODER;
         }
     }
-    if (model.arch == LLM_ARCH_DFLASH) {
+    if (model.arch == LLM_ARCH_DFLASH || model.arch == LLM_ARCH_DSPARK) {
         if (cparams.embeddings && !dflash_decoder_ctx) {
             gtype = LLM_GRAPH_TYPE_ENCODER;
         } else if (dflash_decoder_ctx) {
@@ -3892,6 +3951,10 @@ const float * llama_get_dflash_target_features(llama_context * ctx) {
 
 void llama_set_dflash_accumulated_target_ctx(llama_context * ctx, const float * data, int32_t n_embd, int32_t n_tokens) {
     ctx->set_dflash_accumulated_target_ctx(data, n_embd, n_tokens);
+}
+
+void llama_dspark_markov_bias(llama_context * ctx, const llama_token * prev, int32_t n, float * out_bias) {
+    ctx->dspark_markov_bias(prev, n, out_bias);
 }
 
 

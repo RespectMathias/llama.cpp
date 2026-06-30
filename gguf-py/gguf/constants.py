@@ -495,6 +495,7 @@ class MODEL_ARCH(IntEnum):
     MISTRAL4         = auto()
     EAGLE3           = auto()
     DFLASH           = auto()
+    DSPARK           = auto()
     PADDLEOCR        = auto()
     MIMO2            = auto()
     STEP35           = auto()
@@ -856,6 +857,12 @@ class MODEL_TENSOR(IntEnum):
     # DFlash
     DFLASH_FC          = auto()  # feature fusion layer
     DFLASH_HIDDEN_NORM = auto()  # hidden normalization
+    # DSpark (semi-autoregressive + Markov + confidence)
+    DSPARK_FC          = auto()  # feature fusion layer (same role as DFlash fc)
+    DSPARK_HIDDEN_NORM = auto()  # hidden normalization
+    DSPARK_MARKOV_W1   = auto()  # markov head: prev-token embedding [vocab, markov_rank]
+    DSPARK_MARKOV_W2   = auto()  # markov head: bias projection      [vocab, markov_rank]
+    DSPARK_CONF_PROJ   = auto()  # confidence head: proj             [1, hidden+markov_rank]
     # lfm2 audio
     A_ENC_NORM_CONV        = auto()
     A_ENC_LINEAR_POS       = auto()
@@ -991,6 +998,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.MISTRAL4:         "mistral4",
     MODEL_ARCH.EAGLE3:           "eagle3",
     MODEL_ARCH.DFLASH:           "dflash",
+    MODEL_ARCH.DSPARK:           "dspark",
     MODEL_ARCH.PADDLEOCR:        "paddleocr",
     MODEL_ARCH.MIMO2:            "mimo2",
     MODEL_ARCH.STEP35:           "step35",
@@ -1359,6 +1367,11 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.EAGLE3_D2T:                "d2t",
     MODEL_TENSOR.DFLASH_FC:                 "fc",
     MODEL_TENSOR.DFLASH_HIDDEN_NORM:        "hidden_norm",
+    MODEL_TENSOR.DSPARK_FC:                 "fc",
+    MODEL_TENSOR.DSPARK_HIDDEN_NORM:        "hidden_norm",
+    MODEL_TENSOR.DSPARK_MARKOV_W1:          "markov_w1",
+    MODEL_TENSOR.DSPARK_MARKOV_W2:          "markov_w2",
+    MODEL_TENSOR.DSPARK_CONF_PROJ:          "conf_proj",
 }
 
 MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
@@ -3794,6 +3807,30 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_UP,
         MODEL_TENSOR.DFLASH_FC,
         MODEL_TENSOR.DFLASH_HIDDEN_NORM,
+    ],
+    MODEL_ARCH.DSPARK: [
+        # own embeddings / lm_head (tie_word_embeddings = false)
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.OUTPUT_NORM,
+        # draft backbone layers (same shape family as DFlash)
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_Q_NORM,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_K_NORM,
+        MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.FFN_NORM,
+        MODEL_TENSOR.FFN_GATE,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_UP,
+        # context fusion + dspark heads
+        MODEL_TENSOR.DSPARK_FC,
+        MODEL_TENSOR.DSPARK_HIDDEN_NORM,
+        MODEL_TENSOR.DSPARK_MARKOV_W1,
+        MODEL_TENSOR.DSPARK_MARKOV_W2,
+        MODEL_TENSOR.DSPARK_CONF_PROJ,
     ],
     MODEL_ARCH.MISTRAL4: [
         MODEL_TENSOR.TOKEN_EMBD,

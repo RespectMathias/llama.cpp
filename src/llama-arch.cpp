@@ -129,6 +129,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_MISTRAL4,         "mistral4"         },
     { LLM_ARCH_EAGLE3,           "eagle3"           },
     { LLM_ARCH_DFLASH,           "dflash"           },
+    { LLM_ARCH_DSPARK,           "dspark"           },
     { LLM_ARCH_PADDLEOCR,        "paddleocr"        },
     { LLM_ARCH_MIMO2,            "mimo2"            },
     { LLM_ARCH_STEP35,           "step35"           },
@@ -293,6 +294,13 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_DFLASH_TARGET_LAYER_IDS,     "%s.target_layer_ids"     },
     { LLM_KV_DFLASH_BLOCK_SIZE,           "%s.block_size"           },
     { LLM_KV_DFLASH_MASK_TOKEN_ID,        "%s.mask_token_id"        },
+
+    { LLM_KV_DSPARK_TARGET_LAYER_IDS,             "%s.target_layer_ids"             },
+    { LLM_KV_DSPARK_BLOCK_SIZE,                   "%s.block_size"                   },
+    { LLM_KV_DSPARK_MASK_TOKEN_ID,                "%s.mask_token_id"                },
+    { LLM_KV_DSPARK_MARKOV_RANK,                  "%s.markov_rank"                  },
+    { LLM_KV_DSPARK_CONFIDENCE_HEAD,              "%s.confidence_head"              },
+    { LLM_KV_DSPARK_CONFIDENCE_HEAD_WITH_MARKOV,  "%s.confidence_head_with_markov"  },
 
     { LLM_KV_SHORTCONV_L_CACHE, "%s.shortconv.l_cache" },
     // sentence-transformers dense modules feature dims
@@ -564,6 +572,12 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     // DFlash specific layers
     { LLM_TENSOR_DFLASH_FC,                              "fc" },
     { LLM_TENSOR_DFLASH_HIDDEN_NORM,                     "hidden_norm" },
+    // DSpark specific layers
+    { LLM_TENSOR_DSPARK_FC,                              "fc" },
+    { LLM_TENSOR_DSPARK_HIDDEN_NORM,                     "hidden_norm" },
+    { LLM_TENSOR_DSPARK_MARKOV_W1,                       "markov_w1" },
+    { LLM_TENSOR_DSPARK_MARKOV_W2,                       "markov_w2" },
+    { LLM_TENSOR_DSPARK_CONF_PROJ,                       "conf_proj" },
 };
 
 // declare information about the model weight tensors:
@@ -791,6 +805,15 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     // DFlash tensors
     {LLM_TENSOR_DFLASH_FC,                  {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
     {LLM_TENSOR_DFLASH_HIDDEN_NORM,         {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
+    // DSpark tensors
+    // NOTE: markov_w1/markov_w2/conf_proj are consumed CPU-side in the speculative loop (M3),
+    // not in the ggml graph; op classes below are placeholders for buffer assignment and may be
+    // revisited when wiring CPU access (they likely want a host/CPU buffer or a dequantized copy).
+    {LLM_TENSOR_DSPARK_FC,                  {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_DSPARK_HIDDEN_NORM,         {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
+    {LLM_TENSOR_DSPARK_MARKOV_W1,           {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_GET_ROWS}},
+    {LLM_TENSOR_DSPARK_MARKOV_W2,           {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_DSPARK_CONF_PROJ,           {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
 };
 
 LLM_KV::LLM_KV(llm_arch arch, const char * suffix) : arch(arch), suffix(suffix) {}

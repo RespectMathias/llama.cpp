@@ -114,11 +114,15 @@ int main(int argc, char ** argv) {
         if (params.speculative.dflash) {
             llama_set_dflash(ctx_tgt, model_dft.get());
         }
+        if (params.speculative.dspark) {
+            // DSpark reuses the DFlash target-feature extraction path
+            llama_set_dflash(ctx_tgt, model_dft.get());
+        }
     }
 
-    // Apply chat template for EAGLE3 / DFlash if available which can increase the acceptance rate
+    // Apply chat template for EAGLE3 / DFlash / DSpark if available which can increase the acceptance rate
     std::string prompt = params.prompt;
-    if (params.speculative.eagle3 || params.speculative.dflash) {
+    if (params.speculative.eagle3 || params.speculative.dflash || params.speculative.dspark) {
         auto chat_templates = common_chat_templates_init(model_tgt, params.chat_template);
         if (common_chat_templates_was_explicit(chat_templates.get())) {
             std::vector<common_chat_msg> chat_msgs;
@@ -138,7 +142,7 @@ int main(int argc, char ** argv) {
                 inputs.chat_template_kwargs["reasoning_effort"] = "\"low\"";
             }
             prompt = common_chat_templates_apply(chat_templates.get(), inputs).prompt;
-            LOG_INF("%s: %s chat template applied\n", __func__, params.speculative.eagle3 ? "EAGLE3" : "DFlash");
+            LOG_INF("%s: %s chat template applied\n", __func__, params.speculative.eagle3 ? "EAGLE3" : (params.speculative.dflash ? "DFlash" : "DSpark"));
         }
     }
 
@@ -187,7 +191,7 @@ int main(int argc, char ** argv) {
     int n_past;
 
     // TODO: simplify
-    if (params.speculative.eagle3 || params.speculative.dflash) {
+    if (params.speculative.eagle3 || params.speculative.dflash || params.speculative.dspark) {
         // Target model decodes full prompt and sample first token and intermediate features are extracted
         llama_decode(ctx_tgt, llama_batch_get_one(inp.data(), inp.size()));
 

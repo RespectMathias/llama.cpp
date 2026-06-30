@@ -225,6 +225,14 @@ struct llama_hparams {
     uint32_t dflash_block_size     = 16;
     uint32_t dflash_mask_token_id  = 0;
 
+    // DSpark draft model (semi-autoregressive + Markov + confidence head)
+    std::array<int, 5> dspark_target_layer_ids = {};
+    uint32_t dspark_block_size     = 7;   // anchor-first block (num_speculative_tokens), not 1+N
+    uint32_t dspark_mask_token_id  = 0;
+    uint32_t dspark_markov_rank    = 0;
+    bool     dspark_confidence_head             = false;
+    bool     dspark_confidence_head_with_markov = false;
+
     // gemma4 per-layer embedding
     uint32_t n_embd_per_layer = 0;
 

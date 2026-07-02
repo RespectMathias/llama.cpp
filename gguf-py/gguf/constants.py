@@ -954,10 +954,10 @@ class MODEL_TENSOR(IntEnum):
     NEXTN_SHARED_HEAD_NORM = auto()
     # eagle3
     FC                     = auto()  # feature fusion layer
-    DSPARK_MARKOV_W1       = auto()  # dspark markov head: prev-token embed [vocab, rank]
-    DSPARK_MARKOV_W2       = auto()  # dspark markov head: bias projection  [vocab, rank]
-    DSPARK_CONF_PROJ       = auto()  # dspark confidence head: proj         [1, hidden+rank]
     D2T                    = auto()  # draft to target vocabulary mapping
+    DSPARK_MARKOV_W1       = auto()  # dspark markov head: prev-token embed
+    DSPARK_MARKOV_W2       = auto()  # dspark markov head: bias projection
+    DSPARK_CONF_PROJ       = auto()  # dspark confidence head: proj
     # lfm2 audio
     A_ENC_NORM_CONV        = auto()
     A_ENC_LINEAR_POS       = auto()

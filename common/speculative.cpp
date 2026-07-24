@@ -938,10 +938,24 @@ struct common_speculative_tree {
     int32_t n_rows       = 0;
     llama_pos     root_pos  = 0;
     llama_seq_id  seq_base  = 0;
+    llama_seq_id  seq_ext   = 0; // first of the budget-1 extra leaf sequences reserved for this slot
     llama_seq_id  seq_keep  = 0;
     std::vector<node>         nodes;
     std::vector<llama_seq_id> root_seq_ids;
     std::vector<int32_t>      feature_indices;
+
+    // leaf i uses the slot's own sequence for i == 0 and the reserved extra range beyond
+    llama_seq_id leaf_seq(int32_t i) const {
+        return i == 0 ? seq_base : seq_ext + i - 1;
+    }
+
+    // drop any leftover leaf sequences from a previous (possibly aborted) verification step
+    void clear_ext_seqs(llama_context * ctx_tgt) const {
+        auto * mem_tgt = llama_get_memory(ctx_tgt);
+        for (int32_t i = 0; i < budget - 1; ++i) {
+            llama_memory_seq_rm(mem_tgt, seq_ext + i, -1, -1);
+        }
+    }
 
     void prepare(llama_batch & batch_tgt, llama_context * ctx_tgt,
                  llama_token id_last, llama_pos pos, llama_seq_id seq_id, size_t max_depth) {
@@ -973,21 +987,22 @@ struct common_speculative_tree {
             }
         }
         GGML_ASSERT(!leaves.empty());
-        GGML_ASSERT(leaves.size() <= llama_n_seq_max(ctx_tgt));
+        GGML_ASSERT((int32_t) leaves.size() <= budget);
+        GGML_ASSERT((uint32_t) (seq_ext + budget - 1) <= llama_n_seq_max(ctx_tgt));
 
         for (int32_t i = 0; i < (int32_t) leaves.size(); ++i) {
-            const llama_seq_id leaf_seq = seq_id + i;
-            root_seq_ids.push_back(leaf_seq);
+            const llama_seq_id leaf = leaf_seq(i);
+            root_seq_ids.push_back(leaf);
             for (int32_t nd = leaves[i]; nd >= 0; nd = nodes[nd].parent) {
-                nodes[nd].seq_ids.push_back(leaf_seq);
+                nodes[nd].seq_ids.push_back(leaf);
             }
         }
 
         auto * mem_tgt = llama_get_memory(ctx_tgt);
-        llama_memory_seq_keep(mem_tgt, seq_id);
-        for (llama_seq_id leaf_seq : root_seq_ids) {
-            if (leaf_seq != seq_id) {
-                llama_memory_seq_cp(mem_tgt, seq_id, leaf_seq, -1, -1);
+        clear_ext_seqs(ctx_tgt);
+        for (llama_seq_id leaf : root_seq_ids) {
+            if (leaf != seq_base) {
+                llama_memory_seq_cp(mem_tgt, seq_base, leaf, -1, -1);
             }
         }
 
@@ -1042,13 +1057,23 @@ struct common_speculative_tree {
         auto * mem_tgt = llama_get_memory(ctx_tgt);
         const llama_pos pos_end = root_pos + 1 + n_accepted;
 
+        // trim the kept leaf past the accepted path
         if (!llama_memory_seq_rm(mem_tgt, seq_keep, pos_end, -1)) {
             GGML_ABORT("tree verification requires partial sequence removal");
         }
-        llama_memory_seq_keep(mem_tgt, seq_keep);
+
+        // collapse the accepted path onto the slot's own sequence
+        // note: only this slot's leaf sequences are touched - other slots run concurrently
         if (seq_keep != seq_base) {
+            llama_memory_seq_rm(mem_tgt, seq_base, -1, -1);
             llama_memory_seq_cp(mem_tgt, seq_keep, seq_base, -1, -1);
-            llama_memory_seq_keep(mem_tgt, seq_base);
+        }
+
+        // drop the remaining leaf sequences (including seq_keep if it was an extra leaf)
+        for (llama_seq_id leaf : root_seq_ids) {
+            if (leaf != seq_base) {
+                llama_memory_seq_rm(mem_tgt, leaf, -1, -1);
+            }
         }
     }
 };
@@ -1132,11 +1157,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         if (this->params.n_tree_budget > 0) {
+            const int32_t budget = this->params.n_tree_budget;
             trees.resize(n_seq);
-            for (auto & t : trees) {
-                t.budget = this->params.n_tree_budget;
+            for (uint32_t i = 0; i < n_seq; ++i) {
+                trees[i].budget  = budget;
+                // sequences [0, n_seq) belong to the slots; each slot's extra tree leaves live in
+                // its own reserved range beyond that (leaf 0 reuses the slot's sequence)
+                trees[i].seq_ext = (llama_seq_id) (n_seq + i * (budget - 1));
             }
-            LOG_INF("%s: - tree_budget=%d\n", __func__, this->params.n_tree_budget);
+            LOG_INF("%s: - tree_budget=%d\n", __func__, budget);
         }
 
         // turn on extraction of the target layers' input embeddings
@@ -1162,6 +1191,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             // drop any stale tree from a previous (possibly aborted) generation
             trees[seq_id].nodes.clear();
             trees[seq_id].root_i_batch = -1;
+            trees[seq_id].seq_base     = seq_id;
+            trees[seq_id].clear_ext_seqs(params.ctx_tgt);
         }
 
         const int32_t N = (int32_t) prompt.size();
@@ -1186,24 +1217,25 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             return true;
         }
 
-        // a draft tree is being verified in this batch - its rows are multi-sequence and share
-        // positions, so they cannot be injected here; accept() injects the accepted path instead
-        for (const auto & tree : trees) {
-            if (tree.root_i_batch >= 0) {
-                return true;
-            }
-        }
-
         const int32_t n_tokens = batch_in.n_tokens;
 
         // per-seq inclusive batch range (assumes each seq's tokens are contiguous in the batch)
+        // tree verification rows are skipped: they are multi-sequence, share positions across
+        // branches and live on the reserved leaf sequences - the accepted path's features are
+        // injected in accept() instead. rows of other slots (e.g. concurrent prefills in the
+        // same batch) are still processed here.
         std::vector<int32_t> i_batch_beg(n_seq, -1);
         std::vector<int32_t> i_batch_end(n_seq, -1);
         for (int32_t k = 0; k < n_tokens; ++k) {
-            GGML_ASSERT(batch_in.n_seq_id[k] == 1);
+            if (batch_in.n_seq_id[k] != 1) {
+                continue; // tree row (shared by several leaf sequences)
+            }
             const llama_seq_id seq_id = batch_in.seq_id[k][0];
             if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
-                continue;
+                continue; // reserved tree leaf sequence
+            }
+            if (!trees.empty() && trees[seq_id].root_i_batch >= 0) {
+                continue; // this slot's tree is in flight - all its rows this step are tree rows
             }
             i_batch_end[seq_id] = k;
             if (i_batch_beg[seq_id] < 0) {

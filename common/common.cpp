@@ -1591,8 +1591,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     auto cparams = llama_context_default_params();
 
     cparams.n_ctx             = params.n_ctx;
-    // tree-based speculative verification places each tree leaf on its own sequence
-    cparams.n_seq_max         = std::max(params.n_parallel, params.speculative.draft.n_tree_budget);
+    // tree-based speculative verification places each tree leaf on its own sequence:
+    // every parallel sequence needs up to n_tree_budget - 1 extra leaf sequences
+    cparams.n_seq_max         = params.n_parallel * std::max(1, params.speculative.draft.n_tree_budget);
     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
     cparams.n_batch           = params.n_batch;

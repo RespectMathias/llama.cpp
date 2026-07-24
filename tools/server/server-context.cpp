@@ -483,12 +483,17 @@ struct server_slot {
                         spec_draft.size());
                 // mirror the appended tree rows into the token list - the final render() before
                 // decoding rebuilds the llama_batch from it and would drop them otherwise
+                // also record their indices so post_decode() can verify they are not split
+                // across sub-batches (the tree is sampled with whole-batch logit indices)
                 for (int32_t i = n_before; i < batch.batch.n_tokens; i++) {
                     std::vector<llama_seq_id> seq_ids(
                             batch.batch.seq_id[i],
                             batch.batch.seq_id[i] + batch.batch.n_seq_id[i]);
                     add_ok &= batch.add_multi_seq(batch.batch.token[i], batch.batch.pos[i],
                             std::move(seq_ids), batch.batch.logits[i]);
+                    if (i > n_before) {
+                        spec_i_batch.push_back(i); // n_before is the root, already recorded
+                    }
                 }
                 // spec_i_batch[0] is the root; tree nodes are tracked inside the impl
             } else {
@@ -1042,12 +1047,33 @@ private:
 
         params_base = params;
 
-        // tree-based verification places tree leaves on dedicated sequences and prunes the other
-        // sequences on acceptance - concurrent slots are not supported yet
-        if (params_base.speculative.draft.n_tree_budget > 0 && params_base.n_parallel > 1) {
-            SRV_WRN("tree-based speculative verification does not support n_parallel > 1 yet - forcing n_parallel = 1 (was %d)\n",
-                    params_base.n_parallel);
-            params_base.n_parallel = 1;
+        // tree-based verification: every slot reserves n_tree_budget - 1 extra leaf sequences,
+        // so the total sequence count is n_parallel * n_tree_budget
+        if (params_base.speculative.draft.n_tree_budget > 0) {
+            auto & n_tree_budget = params_base.speculative.draft.n_tree_budget;
+
+            const int32_t n_seq_total = params_base.n_parallel * n_tree_budget;
+            const int32_t n_seq_limit = (int32_t) llama_max_parallel_sequences();
+
+            if (n_seq_total > n_seq_limit) {
+                const int32_t budget_max = n_seq_limit / params_base.n_parallel;
+                if (budget_max < 2) {
+                    SRV_WRN("n_parallel = %d leaves no room for tree leaves (max %d sequences) - disabling tree-based verification\n",
+                            params_base.n_parallel, n_seq_limit);
+                    n_tree_budget = 0;
+                } else {
+                    SRV_WRN("n_parallel * tree_budget = %d exceeds the max of %d sequences - clamping tree_budget to %d\n",
+                            n_seq_total, n_seq_limit, budget_max);
+                    n_tree_budget = budget_max;
+                }
+            }
+
+            // the tree leaves share the common prefix through llama_memory_seq_cp, which is only
+            // cheap (metadata-only) with a unified KV cache
+            if (n_tree_budget > 0 && !params_base.kv_unified) {
+                SRV_WRN("%s", "tree-based verification requires a unified KV cache - enabling kv_unified\n");
+                params_base.kv_unified = true;
+            }
         }
 
         params_base.n_outputs_max = server_n_outputs_max(params_base);

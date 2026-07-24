@@ -3853,6 +3853,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN"));
 
     add_opt(common_arg(
+        {"--tree-budget"}, "N",
+        string_format("token budget for DFlash tree-based verification (0 = disabled, default: %d)", params.speculative.draft.n_tree_budget),
+        [](common_params & params, int value) {
+            params.speculative.draft.n_tree_budget = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+
+    add_opt(common_arg(
         {"--spec-draft-p-split", "--draft-p-split"}, "P",
         string_format("speculative decoding split probability (default: %.2f)", (double)params.speculative.draft.p_split),
         [](common_params & params, const std::string & value) {

@@ -75,6 +75,7 @@ struct server_batch {
         llama_token token;
         llama_pos pos;
         bool output;
+        std::vector<llama_seq_id> seq_ids; // non-empty for tree nodes (multi-seq)
     };
     std::vector<token> tokens;
     int32_t n_tokens_alloc = 0;
@@ -95,9 +96,9 @@ struct server_batch {
         }
     }
 
-    void init(int32_t n_tokens_alloc) {
+    void init(int32_t n_tokens_alloc, int32_t n_seq_max = 1) {
         this->n_tokens_alloc = n_tokens_alloc;
-        batch = llama_batch_init(n_tokens_alloc, 0, 1);
+        batch = llama_batch_init(n_tokens_alloc, 0, n_seq_max);
         tokens.reserve(n_tokens_alloc);
     }
 
@@ -106,7 +107,17 @@ struct server_batch {
         if ((int32_t)tokens.size() >= n_tokens_alloc) {
             return false;
         }
-        tokens.push_back({ id_slot, token, pos, output });
+        tokens.push_back({ id_slot, token, pos, output, {} });
+        return true;
+    }
+
+    // add a tree node that belongs to multiple sequences
+    bool add_multi_seq(llama_token token, llama_pos pos, std::vector<llama_seq_id> seq_ids, bool output) {
+        GGML_ASSERT(batch.token != nullptr);
+        if ((int32_t)tokens.size() >= n_tokens_alloc) {
+            return false;
+        }
+        tokens.push_back({ -1, token, pos, output, std::move(seq_ids) });
         return true;
     }
 
@@ -133,7 +144,11 @@ struct server_batch {
         common_batch_clear(batch);
         for (int32_t i = 0; i < size(); i++) {
             const auto & t = tokens[i];
-            common_batch_add(batch, t.token, t.pos, { t.id_slot }, t.output);
+            if (t.seq_ids.empty()) {
+                common_batch_add(batch, t.token, t.pos, { t.id_slot }, t.output);
+            } else {
+                common_batch_add(batch, t.token, t.pos, t.seq_ids, t.output);
+            }
         }
         batch_rendered = true;
     }
@@ -455,16 +470,37 @@ struct server_slot {
 
             GGML_ASSERT(spec_i_batch.empty());
 
-            spec_i_batch.push_back(batch.size());
-            for (size_t i = 0; i < spec_draft.size(); i++) {
-                spec_i_batch.push_back(batch.size() + i + 1);
-            }
-
             auto pos0 = prompt.tokens.pos_next();
 
-            add_ok &= batch.add(id, sampled, pos0++, true);
-            for (auto token : spec_draft) {
-                add_ok &= batch.add(this->id, token, pos0++, true);
+            if (spec && common_speculative_is_tree(spec)) {
+                // tree mode: let the impl populate the batch with the full tree layout
+                spec_i_batch.push_back(batch.size()); // root position (id_last)
+                // render the current tokens first so the tree rows are appended at the correct
+                // global batch indices
+                batch.render();
+                const int32_t n_before = batch.batch.n_tokens;
+                common_speculative_prepare_tree(spec, id, batch.batch, sampled, pos0,
+                        spec_draft.size());
+                // mirror the appended tree rows into the token list - the final render() before
+                // decoding rebuilds the llama_batch from it and would drop them otherwise
+                for (int32_t i = n_before; i < batch.batch.n_tokens; i++) {
+                    std::vector<llama_seq_id> seq_ids(
+                            batch.batch.seq_id[i],
+                            batch.batch.seq_id[i] + batch.batch.n_seq_id[i]);
+                    add_ok &= batch.add_multi_seq(batch.batch.token[i], batch.batch.pos[i],
+                            std::move(seq_ids), batch.batch.logits[i]);
+                }
+                // spec_i_batch[0] is the root; tree nodes are tracked inside the impl
+            } else {
+                spec_i_batch.push_back(batch.size());
+                for (size_t i = 0; i < spec_draft.size(); i++) {
+                    spec_i_batch.push_back(batch.size() + i + 1);
+                }
+
+                add_ok &= batch.add(id, sampled, pos0++, true);
+                for (auto token : spec_draft) {
+                    add_ok &= batch.add(this->id, token, pos0++, true);
+                }
             }
         }
 
@@ -1005,6 +1041,15 @@ private:
         const bool is_resume = sleeping;
 
         params_base = params;
+
+        // tree-based verification places tree leaves on dedicated sequences and prunes the other
+        // sequences on acceptance - concurrent slots are not supported yet
+        if (params_base.speculative.draft.n_tree_budget > 0 && params_base.n_parallel > 1) {
+            SRV_WRN("tree-based speculative verification does not support n_parallel > 1 yet - forcing n_parallel = 1 (was %d)\n",
+                    params_base.n_parallel);
+            params_base.n_parallel = 1;
+        }
+
         params_base.n_outputs_max = server_n_outputs_max(params_base);
 
         const bool has_mmproj = !params.mmproj.path.empty();
@@ -1333,8 +1378,10 @@ private:
         // the update_slots() logic will always submit a maximum of n_batch or n_parallel tokens
         // note that n_batch can be > n_ctx (e.g. for non-causal attention models such as BERT where the KV cache is not used)
         {
-            const int32_t n_batch = llama_n_batch(ctx_tgt);
-            batch.init(std::max(n_batch, params_base.n_parallel));
+            const int32_t n_batch    = llama_n_batch(ctx_tgt);
+            const int32_t n_tree_max = params_base.speculative.draft.n_tree_budget;
+            const int32_t n_seq_max  = n_tree_max > 0 ? n_tree_max : 1;
+            batch.init(std::max(n_batch, params_base.n_parallel), n_seq_max);
         }
 
         if (params_base.cache_ram_mib != 0) {
@@ -3806,9 +3853,19 @@ private:
                 // save the sampler sampler state in case we need to restore it
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
-                GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
-                auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
-                slot.spec_i_batch.clear();
+                GGML_ASSERT(!slot.spec_i_batch.empty());
+
+                const bool is_tree = spec && common_speculative_is_tree(spec.get());
+
+                llama_tokens accepted;
+                if (is_tree) {
+                    accepted = common_speculative_sample_tree(spec.get(), slot.id, slot.smpl.get(), slot.ctx_tgt);
+                    slot.spec_i_batch.clear();
+                } else {
+                    GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
+                    accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                    slot.spec_i_batch.clear();
+                }
 
                 GGML_ASSERT(accepted.size() >= 1);
 
@@ -3819,7 +3876,9 @@ private:
                     (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_rollback > llama_n_rs_seq(ctx_tgt));
 
                 // check for partial draft acceptance
-                if (n_rollback > 0) {
+                // note: in tree mode the accepted path length is not comparable to spec_draft
+                //       and KV rollback is handled by the tree accept, so skip this branch
+                if (!is_tree && n_rollback > 0) {
                     if (use_ckpt_tgt) {
                         if (trace > 0) {
                             SLT_INF(slot, "accepted %2zu/%2zu draft tokens (restore checkpoint)\n", accepted.size() - 1, slot.spec_draft.size());

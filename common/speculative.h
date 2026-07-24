@@ -70,6 +70,17 @@ void common_speculative_draft(common_speculative * spec);
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
 
+// tree-based verification: returns true if the current implementation drafts a token tree
+bool common_speculative_is_tree(common_speculative * spec);
+
+// tree-based verification: populate batch_tgt with the draft tree for seq_id
+void common_speculative_prepare_tree(common_speculative * spec, llama_seq_id seq_id,
+        llama_batch & batch_tgt, llama_token id_last, llama_pos pos, size_t max_depth);
+
+// tree-based verification: sample the accepted path from the decoded tree; returns accepted tokens
+llama_tokens common_speculative_sample_tree(common_speculative * spec, llama_seq_id seq_id,
+        common_sampler * smpl, llama_context * ctx_tgt);
+
 // (optional) get/set internal state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
 void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);

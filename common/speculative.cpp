@@ -1232,7 +1232,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
             const llama_seq_id seq_id = batch_in.seq_id[k][0];
             if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
-                continue; // reserved tree leaf sequence
+                continue;
             }
             if (!trees.empty() && trees[seq_id].root_i_batch >= 0) {
                 continue; // this slot's tree is in flight - all its rows this step are tree rows
@@ -2546,7 +2546,6 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
                 n_max = std::max(n_max, std::max(0, spec->draft.n_max));
                 break;
             case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
-                // in tree mode, up to n_tree_budget rows are verified per step
                 n_max = std::max(n_max, std::max({0, spec->draft.n_max, spec->draft.n_tree_budget}));
                 break;
             case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:

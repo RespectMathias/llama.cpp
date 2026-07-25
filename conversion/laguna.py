@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import json
 import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING
 
 import torch
@@ -205,3 +206,127 @@ class LagunaModel(TextModel):
                     f"declared {gate_type} gate (expected {expected}); weights and config disagree.")
 
         yield from TextModel.modify_tensors(self, data_torch, name, bid)
+
+
+@ModelBase.register("LagunaDSparkModel")
+class LagunaDSparkModel(LagunaModel):
+    model_arch = gguf.MODEL_ARCH.DFLASH
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        rp = self.rope_parameters
+        if "full_attention" not in rp:
+            rp["full_attention"] = {
+                "rope_theta": rp.get("rope_theta", self.hparams.get("rope_theta", 500000.0)),
+                "partial_rotary_factor": rp.get("partial_rotary_factor", 1.0),
+            }
+        swa = self.hparams.get("swa_rope_parameters")
+        if swa and "sliding_attention" not in rp:
+            rp["sliding_attention"] = swa
+
+    def set_vocab(self):
+        if self.target_model_dir is None:
+            raise ValueError(
+                "Laguna DSpark requires --target-model-dir to be specified. "
+                "Please provide the path to the target model directory containing the tokenizer."
+            )
+        logger.info(f"Laguna DSpark: Using tokenizer from target model: {self.target_model_dir}")
+        original_dir = self.dir_model
+        self.dir_model = self.target_model_dir
+
+        from . import get_model_class
+        with open(self.target_model_dir / "config.json", "r", encoding="utf-8") as f:
+            target_arch = json.load(f)["architectures"][0]
+        target_cls = get_model_class(target_arch)
+
+        if target_cls is not type(self):
+            target_cls.set_vocab(self)
+        else:
+            super().set_vocab()
+
+        self.dir_model = original_dir
+
+    def set_gguf_parameters(self):
+        n_experts = self.hparams.get("num_experts", 0)
+        saved = {}
+        if n_experts == 0:
+            for k in ("num_experts_per_tok", "num_experts_per_token", "top_k_experts"):
+                if k in self.hparams:
+                    saved[k] = self.hparams.pop(k)
+        TextModel.set_gguf_parameters(self)
+        self.hparams.update(saved)
+        hparams = self.hparams
+
+        self.gguf_writer.add_vocab_size(hparams["vocab_size"])
+
+        per_layer_heads = hparams.get("num_attention_heads_per_layer")
+        if not per_layer_heads:
+            per_layer_heads = [hparams["num_attention_heads"]] * hparams["num_hidden_layers"]
+        self.gguf_writer.add_head_count(per_layer_heads)
+
+        self._attn_gate_types()
+
+        sliding_window = hparams.get("sliding_window") or 0
+        if sliding_window > 0:
+            self.gguf_writer.add_sliding_window(sliding_window)
+
+        head_dim = hparams["head_dim"]
+        rp = self.rope_parameters
+        full_rope = rp.get("full_attention", rp)
+        self.gguf_writer.add_rope_dimension_count(
+            int(head_dim * float(full_rope.get("partial_rotary_factor", 1.0))))
+        swa_rope = rp.get("sliding_attention")
+        if swa_rope is not None:
+            self.gguf_writer.add_rope_dimension_count_swa(
+                int(head_dim * float(swa_rope.get("partial_rotary_factor", 1.0))))
+
+        block_size = hparams.get("block_size", 16)
+        self.gguf_writer.add_block_size(block_size)
+
+        target_layer_ids = hparams.get("target_layer_ids", [])
+        if target_layer_ids:
+            self.gguf_writer.add_target_layers(target_layer_ids)
+
+        if sliding_window > 0:
+            layer_types = hparams.get("layer_types")
+            if layer_types:
+                is_swa = [lt == "sliding_attention" for lt in layer_types]
+                self.gguf_writer.add_sliding_window_pattern(is_swa)
+
+    @classmethod
+    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+        name, gen = item
+
+        if not name.startswith("model."):
+            name = "model." + name
+
+        if name.endswith(("embed_tokens.weight", "lm_head.weight")):
+            return None
+
+        if "aux_hidden_norms" in name:
+            return None
+
+        return super().filter_tensors((name, gen))
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if bid is not None and "qkv_proj" in name:
+            n_heads = self.hparams["num_attention_heads"]
+            n_kv_heads = self.hparams["num_key_value_heads"]
+            head_dim = self.hparams["head_dim"]
+
+            q_size = n_heads * head_dim
+            k_size = n_kv_heads * head_dim
+
+            q, k, v = torch.split(data_torch, [q_size, k_size, k_size], dim=0)
+
+            q_name = name.replace("qkv_proj.weight", "q_proj.weight")
+            k_name = name.replace("qkv_proj.weight", "k_proj.weight")
+            v_name = name.replace("qkv_proj.weight", "v_proj.weight")
+
+            return [
+                (self.map_tensor_name(q_name), q),
+                (self.map_tensor_name(k_name), k),
+                (self.map_tensor_name(v_name), v),
+            ]
+
+        return LagunaModel.modify_tensors(self, data_torch, name, bid)

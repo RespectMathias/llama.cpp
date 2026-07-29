@@ -205,3 +205,77 @@ class LagunaModel(TextModel):
                     f"declared {gate_type} gate (expected {expected}); weights and config disagree.")
 
         yield from TextModel.modify_tensors(self, data_torch, name, bid)
+
+
+@ModelBase.register("DFlashLagunaForCausalLM")
+class DFlashLagunaModel(LagunaModel):
+    model_arch = gguf.MODEL_ARCH.DFLASH
+    _aux_norms: dict[int, Tensor] | None = None
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.hparams.setdefault("dflash_config", {
+            k: self.hparams[k] for k in ("target_layer_ids", "mask_token_id") if k in self.hparams
+        })
+        self.hparams.setdefault("mlp_layer_types", ["dense"] * self.hparams["num_hidden_layers"])
+        if self.hparams.get("num_experts", 0) == 0:
+            self.hparams["num_experts_per_tok"] = 0
+        if "full_attention" not in self.rope_parameters:
+            full_rope = dict(self.rope_parameters)
+            self.rope_parameters = {"full_attention": full_rope}
+            if swa_rope := self.hparams.get("swa_rope_parameters"):
+                self.rope_parameters["sliding_attention"] = swa_rope
+
+    def set_vocab(self) -> None:
+        if self.target_model_dir is None:
+            raise ValueError("Laguna DSpark requires --target-model-dir for its tokenizer")
+        original_dir = self.dir_model
+        self.dir_model = self.target_model_dir
+        try:
+            super().set_vocab()
+        finally:
+            self.dir_model = original_dir
+        mask_token_id = self.hparams["dflash_config"].get("mask_token_id")
+        if mask_token_id is not None:
+            self.gguf_writer.add_mask_token_id(mask_token_id)
+
+    def set_gguf_parameters(self) -> None:
+        super().set_gguf_parameters()
+        self.gguf_writer.add_decoder_arch("laguna")
+        dflash_config = self.hparams["dflash_config"]
+        self.gguf_writer.add_block_size(dflash_config.get("block_size", self.hparams.get("block_size", 16)))
+        target_layer_ids = dflash_config.get("target_layer_ids", [])
+        if target_layer_ids:
+            self.gguf_writer.add_target_layers([i + 1 for i in target_layer_ids])
+
+        layer_types = self.hparams.get("layer_types")
+        if self.hparams.get("sliding_window") and layer_types:
+            self.gguf_writer.add_sliding_window_pattern([t == "sliding_attention" for t in layer_types])
+
+    @classmethod
+    def filter_tensors(cls, item):
+        name, gen = item
+        if name.endswith(("embed_tokens.weight", "lm_head.weight")):
+            return None
+        if not name.startswith("model."):
+            name = "model." + name
+        return super().filter_tensors((name, gen))
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        match = re.fullmatch(r"(?:model\.)?aux_hidden_norms\.(\d+)\.weight", name)
+        if match:
+            if self._aux_norms is None:
+                self._aux_norms = {}
+            self._aux_norms[int(match.group(1))] = data_torch
+            n_aux = len(self.hparams["dflash_config"].get("target_layer_ids", []))
+            if n_aux and len(self._aux_norms) == n_aux:
+                stacked = torch.stack([self._aux_norms[i] for i in range(n_aux)], dim=0)
+                yield (self.format_tensor_name(gguf.MODEL_TENSOR.ENC_AUX_NORM), stacked)
+            return
+
+        yield from super().modify_tensors(data_torch, name, bid)
+
+
+@ModelBase.register("LagunaDSparkModel")
+class LagunaDSparkModel(DFlashLagunaModel):
+    model_arch = gguf.MODEL_ARCH.DFLASH
